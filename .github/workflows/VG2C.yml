@@ -1,0 +1,158 @@
+name: Fetch and Clean VPNGate YAML
+
+on:
+  schedule:
+    - cron: '*/25 * * * *'
+  workflow_dispatch:
+
+jobs:
+  fetch-clean:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Fetch vpngate.yaml with retry
+        id: fetch
+        env:
+          VPNGATE_URL: ${{ secrets.VPNGATE_URL }}
+        run: |
+          set -e
+          OUTPUT="vpngate.yaml"
+          MAX_RETRY=3
+          TIMEOUT=10
+
+          if [ -z "$VPNGATE_URL" ]; then
+            echo "错误：未配置 VPNGATE_URL secret"
+            exit 1
+          fi
+
+          for i in $(seq 1 $MAX_RETRY); do
+            echo "尝试第 $i 次请求..."
+            if curl --silent --show-error --fail --location \
+                    --max-time "$TIMEOUT" \
+                    --output "$OUTPUT" \
+                    "$VPNGATE_URL"; then
+              if [ -s "$OUTPUT" ]; then
+                echo "请求成功，文件大小: $(wc -c < "$OUTPUT") 字节"
+                echo "success=true" >> $GITHUB_OUTPUT
+                exit 0
+              else
+                echo "请求成功但文件为空"
+              fi
+            else
+              echo "第 $i 次请求失败（退出码 $?）"
+            fi
+            if [ $i -lt $MAX_RETRY ]; then
+              sleep 5
+            fi
+          done
+
+          echo "三次请求均失败，终止本次任务"
+          echo "success=false" >> $GITHUB_OUTPUT
+          exit 1
+
+      - name: Validate proxies count
+        id: validate
+        if: steps.fetch.outputs.success == 'true'
+        run: |
+          set -e
+          COUNT=$(grep -c '^\s*-\s*name:' vpngate.yaml || true)
+          echo "检测到节点数量: $COUNT"
+          if [ "$COUNT" -lt 2 ]; then
+            echo "节点数量不足 2 个，文件无效，终止本次任务"
+            exit 1
+          fi
+          echo "文件有效，节点数: $COUNT"
+
+      - name: Clean vpngate.yaml (keep only proxies section)
+        if: steps.fetch.outputs.success == 'true'
+        run: |
+          set -e
+          python3 - <<'PYEOF'
+          import re
+
+          with open('vpngate.yaml', 'r', encoding='utf-8') as f:
+              lines = f.readlines()
+
+          out = []
+          in_proxies = False
+          found_proxies = False
+
+          for line in lines:
+              stripped = line.rstrip('\n')
+
+              if re.match(r'^proxies:\s*$', stripped):
+                  in_proxies = True
+                  found_proxies = True
+                  out.append('proxies:')
+                  continue
+
+              if in_proxies:
+                  if re.match(r'^[A-Za-z0-9_-]+:', stripped):
+                      break
+                  out.append(stripped)
+
+          if not found_proxies:
+              raise SystemExit('未找到 proxies: 字段，文件无效')
+
+          while out and out[-1].strip() == '':
+              out.pop()
+
+          with open('vpngate.yaml', 'w', encoding='utf-8') as f:
+              f.write('\n'.join(out) + '\n')
+
+          print(f'清理完成，输出 {len(out)} 行')
+          PYEOF
+
+      - name: Show cleaned summary
+        if: steps.fetch.outputs.success == 'true'
+        run: |
+          set -e
+          TOTAL_LINES=$(wc -l < vpngate.yaml)
+          NODE_COUNT=$(grep -c '^\s*-\s*name:' vpngate.yaml || true)
+
+          echo "===== 清理结果摘要 ====="
+          echo "总行数: $TOTAL_LINES"
+          echo "节点数: $NODE_COUNT"
+          echo ""
+
+          if [ "$NODE_COUNT" -le 3 ]; then
+            echo "===== 节点较少，完整输出 ====="
+            cat vpngate.yaml
+          else
+            echo "===== 第一个节点 ====="
+            awk '
+              /^\s*-\s*name:/ { n++; if (n==2) exit }
+              n>=1 { print }
+            ' vpngate.yaml
+
+            echo ""
+            echo "===== 最后一个节点 ====="
+            awk '
+              { lines[NR]=$0 }
+              /^\s*-\s*name:/ { starts[NR]=1 }
+              END {
+                last=0
+                for (i=NR; i>=1; i--) {
+                  if (starts[i]) { last=i; break }
+                }
+                if (last>0) {
+                  for (i=last; i<=NR; i++) print lines[i]
+                }
+              }
+            ' vpngate.yaml
+          fi
+
+      - name: Commit and push
+        if: steps.fetch.outputs.success == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add vpngate.yaml
+          if git diff --cached --quiet; then
+            echo "文件无变化，跳过提交"
+          else
+            git commit -m "chore: update vpngate.yaml $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+            git push
+          fi
