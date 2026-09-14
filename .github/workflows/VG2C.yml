@@ -1,4 +1,4 @@
-name: Fetch and Clean VPNGate YAML
+name: VG2C YAML
 
 on:
   schedule:
@@ -6,6 +6,9 @@ on:
   workflow_dispatch:
 
 jobs:
+  # ============================================================
+  # 原有任务：从 VPNGATE_URL 抓取并清理为 vpngate.yaml
+  # ============================================================
   fetch-clean:
     runs-on: ubuntu-latest
     steps:
@@ -154,5 +157,191 @@ jobs:
             echo "文件无变化，跳过提交"
           else
             git commit -m "chore: update vpngate.yaml $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+            git push
+          fi
+
+  # ============================================================
+  # 新增任务：按地区抓取并清理为 vpngate-<region>.yaml
+  # URL 全部通过 secrets 隐藏，不在 workflow 中明文出现
+  # 以后扩展只需：1) 在 matrix.include 加一行 region/output
+  #              2) 在 GitHub Secrets 里新增对应 URL secret
+  # ============================================================
+  fetch-clean-regions:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - region: jp
+            output: "vpngate-jp.yaml"
+            secret_name: VPNGATE_JP_URL
+          - region: kr
+            output: "vpngate-kr.yaml"
+            secret_name: VPNGATE_KR_URL
+          # 以后扩展示例（同时要在 Secrets 里新增对应 URL）：
+          # - region: us
+          #   output: "vpngate-us.yaml"
+          #   secret_name: VPNGATE_US_URL
+          # - region: jp-bandwidth
+          #   output: "vpngate-jp-bandwidth.yaml"
+          #   secret_name: VPNGATE_JP_BANDWIDTH_URL
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Fetch ${{ matrix.output }} with retry
+        id: fetch
+        env:
+          # 关键：把 matrix 里指定的 secret 名字映射成实际 secret 值
+          TARGET_URL: ${{ secrets[matrix.secret_name] }}
+          OUTPUT: ${{ matrix.output }}
+        run: |
+          set -e
+          MAX_RETRY=3
+          TIMEOUT=10
+
+          if [ -z "$TARGET_URL" ]; then
+            echo "错误：未配置 secret ${{ matrix.secret_name }}"
+            exit 1
+          fi
+
+          for i in $(seq 1 $MAX_RETRY); do
+            echo "尝试第 $i 次请求（$OUTPUT）..."
+            if curl --silent --show-error --fail --location \
+                    --max-time "$TIMEOUT" \
+                    --output "$OUTPUT" \
+                    "$TARGET_URL"; then
+              if [ -s "$OUTPUT" ]; then
+                echo "请求成功，文件大小: $(wc -c < "$OUTPUT") 字节"
+                echo "success=true" >> $GITHUB_OUTPUT
+                exit 0
+              else
+                echo "请求成功但文件为空"
+              fi
+            else
+              echo "第 $i 次请求失败（退出码 $?）"
+            fi
+            if [ $i -lt $MAX_RETRY ]; then
+              sleep 5
+            fi
+          done
+
+          echo "三次请求均失败，终止本次任务"
+          echo "success=false" >> $GITHUB_OUTPUT
+          exit 1
+
+      - name: Validate proxies count for ${{ matrix.output }}
+        id: validate
+        if: steps.fetch.outputs.success == 'true'
+        env:
+          OUTPUT: ${{ matrix.output }}
+        run: |
+          set -e
+          COUNT=$(grep -c '^\s*-\s*name:' "$OUTPUT" || true)
+          echo "检测到节点数量: $COUNT"
+          if [ "$COUNT" -lt 2 ]; then
+            echo "节点数量不足 2 个，文件无效，终止本次任务"
+            exit 1
+          fi
+          echo "文件有效，节点数: $COUNT"
+
+      - name: Clean ${{ matrix.output }} (keep only proxies section)
+        if: steps.fetch.outputs.success == 'true'
+        env:
+          OUTPUT: ${{ matrix.output }}
+        run: |
+          set -e
+          python3 - <<'PYEOF'
+          import os
+          import re
+
+          output = os.environ['OUTPUT']
+
+          with open(output, 'r', encoding='utf-8') as f:
+              lines = f.readlines()
+
+          out = []
+          in_proxies = False
+          found_proxies = False
+
+          for line in lines:
+              stripped = line.rstrip('\n')
+
+              if re.match(r'^proxies:\s*$', stripped):
+                  in_proxies = True
+                  found_proxies = True
+                  out.append('proxies:')
+                  continue
+
+              if in_proxies:
+                  if re.match(r'^[A-Za-z0-9_-]+:', stripped):
+                      break
+                  out.append(stripped)
+
+          if not found_proxies:
+              raise SystemExit(f'未找到 proxies: 字段，文件 {output} 无效')
+
+          while out and out[-1].strip() == '':
+              out.pop()
+
+          with open(output, 'w', encoding='utf-8') as f:
+              f.write('\n'.join(out) + '\n')
+
+          print(f'清理完成，{output} 输出 {len(out)} 行')
+          PYEOF
+
+      - name: Show cleaned summary for ${{ matrix.output }}
+        if: steps.fetch.outputs.success == 'true'
+        env:
+          OUTPUT: ${{ matrix.output }}
+        run: |
+          set -e
+          TOTAL_LINES=$(wc -l < "$OUTPUT")
+          NODE_COUNT=$(grep -c '^\s*-\s*name:' "$OUTPUT" || true)
+
+          echo "===== 清理结果摘要（$OUTPUT）====="
+          echo "总行数: $TOTAL_LINES"
+          echo "节点数: $NODE_COUNT"
+          echo ""
+
+          if [ "$NODE_COUNT" -le 3 ]; then
+            echo "===== 节点较少，完整输出 ====="
+            cat "$OUTPUT"
+          else
+            echo "===== 第一个节点 ====="
+            awk '
+              /^\s*-\s*name:/ { n++; if (n==2) exit }
+              n>=1 { print }
+            ' "$OUTPUT"
+
+            echo ""
+            echo "===== 最后一个节点 ====="
+            awk '
+              { lines[NR]=$0 }
+              /^\s*-\s*name:/ { starts[NR]=1 }
+              END {
+                last=0
+                for (i=NR; i>=1; i--) {
+                  if (starts[i]) { last=i; break }
+                }
+                if (last>0) {
+                  for (i=last; i<=NR; i++) print lines[i]
+                }
+              }
+            ' "$OUTPUT"
+          fi
+
+      - name: Commit and push ${{ matrix.output }}
+        if: steps.fetch.outputs.success == 'true'
+        env:
+          OUTPUT: ${{ matrix.output }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add "$OUTPUT"
+          if git diff --cached --quiet; then
+            echo "文件 $OUTPUT 无变化，跳过提交"
+          else
+            git commit -m "chore: update $OUTPUT $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
             git push
           fi
