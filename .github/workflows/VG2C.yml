@@ -336,12 +336,26 @@ jobs:
         env:
           OUTPUT: ${{ matrix.output }}
         run: |
+          set -e
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add "$OUTPUT"
           if git diff --cached --quiet; then
             echo "文件 $OUTPUT 无变化，跳过提交"
-          else
-            git commit -m "chore: update $OUTPUT $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
-            git push
+            exit 0
           fi
+          git commit -m "chore: update $OUTPUT $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+
+          # 关键：push 前先 rebase 到远端最新，避免 non-fast-forward
+          MAX_PUSH_RETRY=5
+          for i in $(seq 1 $MAX_PUSH_RETRY); do
+            echo "第 $i 次尝试 push ..."
+            if git pull --rebase origin main && git push origin HEAD:main; then
+              echo "push 成功"
+              exit 0
+            fi
+            echo "push 失败，重试中 ..."
+            sleep 3
+          done
+          echo "多次 push 仍失败"
+          exit 1
