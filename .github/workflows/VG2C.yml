@@ -147,18 +147,35 @@ jobs:
             ' vpngate.yaml
           fi
 
+      # ============================================================
+      # 关键修改：原任务的 Commit and push 也加上 rebase + 重试
+      # 与地区任务保持一致，避免并行 push 时 non-fast-forward
+      # ============================================================
       - name: Commit and push
         if: steps.fetch.outputs.success == 'true'
         run: |
+          set -e
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add vpngate.yaml
           if git diff --cached --quiet; then
             echo "文件无变化，跳过提交"
-          else
-            git commit -m "chore: update vpngate.yaml $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
-            git push
+            exit 0
           fi
+          git commit -m "chore: update vpngate.yaml $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+
+          MAX_PUSH_RETRY=5
+          for i in $(seq 1 $MAX_PUSH_RETRY); do
+            echo "第 $i 次尝试 push ..."
+            if git pull --rebase origin main && git push origin HEAD:main; then
+              echo "push 成功"
+              exit 0
+            fi
+            echo "push 失败，重试中 ..."
+            sleep 3
+          done
+          echo "多次 push 仍失败"
+          exit 1
 
   # ============================================================
   # 新增任务：按地区抓取并清理为 vpngate-<region>.yaml
@@ -182,9 +199,6 @@ jobs:
             output: "vpngate-us.yaml"
             secret_name: VPNGATE_US_URL
           # 以后扩展示例（同时要在 Secrets 里新增对应 URL）：
-          # - region: us
-          #   output: "vpngate-us.yaml"
-          #   secret_name: VPNGATE_US_URL
           # - region: jp-bandwidth
           #   output: "vpngate-jp-bandwidth.yaml"
           #   secret_name: VPNGATE_JP_BANDWIDTH_URL
@@ -349,7 +363,6 @@ jobs:
           fi
           git commit -m "chore: update $OUTPUT $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
 
-          # 关键：push 前先 rebase 到远端最新，避免 non-fast-forward
           MAX_PUSH_RETRY=5
           for i in $(seq 1 $MAX_PUSH_RETRY); do
             echo "第 $i 次尝试 push ..."
